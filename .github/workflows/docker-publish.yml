@@ -1,0 +1,159 @@
+name: Publish SKY-MAP CI images
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: skymap-ci-dockerhub-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: ${{ github.repository == 'keeperlink/skymap-ci' && github.ref == 'refs/heads/main' }}
+    # Configure this environment to allow ONLY main before first dispatch.
+    environment: dockerhub-publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      IMAGE: keeperlink/skymap-ci
+      TAG_24: ubuntu24.04-py312
+      TAG_26: ubuntu26.04-py314
+
+    steps:
+      - name: Require successful CI on current main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = keeperlink/skymap-ci
+          test "$GITHUB_REF" = refs/heads/main
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" = "$GITHUB_SHA"
+          latest="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=push&per_page=1" --jq '.workflow_runs[0] | [.head_sha, .conclusion] | join(":")')"
+          test "$latest" = "$GITHUB_SHA:success"
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (Node 24)
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4 (Node 24)
+
+      - name: Build attested Ubuntu 24.04 OCI archive
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7 (Node 24)
+        with:
+          context: .
+          file: Dockerfile
+          pull: true
+          no-cache-filters: runtime-base
+          platforms: linux/amd64
+          outputs: type=oci,dest=${{ runner.temp }}/skymap-ci-24.oci.tar
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            UBUNTU_VERSION=24.04
+            EXPECTED_PYTHON=3.12
+          labels: |
+            org.opencontainers.image.source=https://github.com/keeperlink/skymap-ci
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.TAG_24 }}-v${{ github.run_number }}
+          cache-from: type=gha,scope=skymap-ci-${{ env.TAG_24 }}
+
+      - name: Build attested Ubuntu 26.04 OCI archive
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7 (Node 24)
+        with:
+          context: .
+          file: Dockerfile
+          pull: true
+          no-cache-filters: runtime-base
+          platforms: linux/amd64
+          outputs: type=oci,dest=${{ runner.temp }}/skymap-ci-26.oci.tar
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            UBUNTU_VERSION=26.04
+            EXPECTED_PYTHON=3.14
+          labels: |
+            org.opencontainers.image.source=https://github.com/keeperlink/skymap-ci
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.TAG_26 }}-v${{ github.run_number }}
+          cache-from: type=gha,scope=skymap-ci-${{ env.TAG_26 }}
+
+      - name: Install OCI archive copy tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+          skopeo --version
+
+      - name: Verify both attested OCI indexes and smoke-test exact binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for entry in "24:$TAG_24:24.04:3.12" "26:$TAG_26:26.04:3.14"; do
+            IFS=: read -r number tag os py <<< "$entry"
+            archive="oci-archive:${RUNNER_TEMP}/skymap-ci-${number}.oci.tar"
+            skopeo inspect --raw "$archive" | jq -e '
+              (.manifests | map(select(.platform.os == "linux" and
+                .platform.architecture == "amd64")) | length) == 1
+              and (.manifests | map(select(
+                .annotations["vnd.docker.reference.type"] == "attestation-manifest"
+              )) | length) >= 1
+            ' >/dev/null
+            skopeo copy "$archive" \
+              "docker-archive:${RUNNER_TEMP}/skymap-ci-${number}-smoke.tar:skymap-ci-smoke:${tag}"
+            docker load --input "${RUNNER_TEMP}/skymap-ci-${number}-smoke.tar"
+            bash tests/smoke-image.sh "skymap-ci-smoke:${tag}" "$os" "$py"
+          done
+
+      - name: Require unused immutable version tags on Docker Hub
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tag in "$TAG_24" "$TAG_26"; do
+            version="${tag}-v${GITHUB_RUN_NUMBER}"
+            status="$(curl --silent --show-error --output /dev/null \
+              --max-time 20 --write-out '%{http_code}' \
+              "https://hub.docker.com/v2/repositories/${IMAGE}/tags/${version}")"
+            case "$status" in
+              404) ;;
+              200) echo "Immutable tag already exists: ${IMAGE}:${version}" >&2; exit 1 ;;
+              *) echo "Could not verify Docker Hub tag ${version} (HTTP ${status})" >&2; exit 1 ;;
+            esac
+          done
+
+      - name: Login to Docker Hub after both images pass
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4 (Node 24)
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish verified immutable versions and platform aliases
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          for entry in "24:$TAG_24" "26:$TAG_26"; do
+            IFS=: read -r number tag <<< "$entry"
+            version="${tag}-v${GITHUB_RUN_NUMBER}"
+            archive="oci-archive:${RUNNER_TEMP}/skymap-ci-${number}.oci.tar"
+            expected="sha256:$(skopeo inspect --raw "$archive" | sha256sum | cut -d' ' -f1)"
+            skopeo copy --all --preserve-digests \
+              --dest-authfile "$HOME/.docker/config.json" \
+              --digestfile "${RUNNER_TEMP}/${tag}.digest" \
+              "$archive" "docker://docker.io/${IMAGE}:${version}"
+            test "$(cat "${RUNNER_TEMP}/${tag}.digest")" = "$expected"
+            docker buildx imagetools create \
+              --tag "docker.io/${IMAGE}:${tag}" \
+              "docker.io/${IMAGE}:${version}"
+            for published in "$version" "$tag"; do
+              actual="sha256:$(docker buildx imagetools inspect --raw "docker.io/${IMAGE}:${published}" | sha256sum | cut -d' ' -f1)"
+              test "$actual" = "$expected"
+            done
+            echo "${tag}_digest=${expected}" >> "$GITHUB_OUTPUT"
+            echo "Published ${IMAGE}:${version} and ${IMAGE}:${tag} (${expected})" >> "$GITHUB_STEP_SUMMARY"
+          done
