@@ -60,7 +60,6 @@ jobs:
             org.opencontainers.image.source=https://github.com/keeperlink/skymap-ci
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.TAG_24 }}-v${{ github.run_number }}
-          cache-from: type=gha,scope=skymap-ci-${{ env.TAG_24 }}
 
       - name: Build attested Ubuntu 26.04 OCI archive
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7 (Node 24)
@@ -80,7 +79,6 @@ jobs:
             org.opencontainers.image.source=https://github.com/keeperlink/skymap-ci
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.TAG_26 }}-v${{ github.run_number }}
-          cache-from: type=gha,scope=skymap-ci-${{ env.TAG_26 }}
 
       - name: Install OCI archive copy tool
         shell: bash
@@ -132,11 +130,13 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Publish verified immutable versions and platform aliases
+      - name: Publish both immutable versions before updating aliases
         id: release
         shell: bash
         run: |
           set -euo pipefail
+          # Do not advance either moving alias until BOTH immutable versions
+          # have been pushed and their exact OCI digests verified.
           for entry in "24:$TAG_24" "26:$TAG_26"; do
             IFS=: read -r number tag <<< "$entry"
             version="${tag}-v${GITHUB_RUN_NUMBER}"
@@ -147,13 +147,21 @@ jobs:
               --digestfile "${RUNNER_TEMP}/${tag}.digest" \
               "$archive" "docker://docker.io/${IMAGE}:${version}"
             test "$(cat "${RUNNER_TEMP}/${tag}.digest")" = "$expected"
+            actual="sha256:$(docker buildx imagetools inspect --raw "docker.io/${IMAGE}:${version}" | sha256sum | cut -d' ' -f1)"
+            test "$actual" = "$expected"
+            echo "${tag}_digest=${expected}" >> "$GITHUB_OUTPUT"
+            echo "Verified immutable ${IMAGE}:${version} (${expected})" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          # Only after both immutable images exist, update the two moving
+          # aliases; a later alias operation can still fail, so report it.
+          for tag in "$TAG_24" "$TAG_26"; do
+            version="${tag}-v${GITHUB_RUN_NUMBER}"
+            expected="$(cat "${RUNNER_TEMP}/${tag}.digest")"
             docker buildx imagetools create \
               --tag "docker.io/${IMAGE}:${tag}" \
               "docker.io/${IMAGE}:${version}"
-            for published in "$version" "$tag"; do
-              actual="sha256:$(docker buildx imagetools inspect --raw "docker.io/${IMAGE}:${published}" | sha256sum | cut -d' ' -f1)"
-              test "$actual" = "$expected"
-            done
-            echo "${tag}_digest=${expected}" >> "$GITHUB_OUTPUT"
-            echo "Published ${IMAGE}:${version} and ${IMAGE}:${tag} (${expected})" >> "$GITHUB_STEP_SUMMARY"
+            actual="sha256:$(docker buildx imagetools inspect --raw "docker.io/${IMAGE}:${tag}" | sha256sum | cut -d' ' -f1)"
+            test "$actual" = "$expected"
+            echo "Published ${IMAGE}:${tag} (${expected})" >> "$GITHUB_STEP_SUMMARY"
           done

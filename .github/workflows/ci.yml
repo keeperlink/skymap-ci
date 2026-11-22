@@ -51,8 +51,9 @@ jobs:
           build-args: |
             UBUNTU_VERSION=${{ matrix.ubuntu }}
             EXPECTED_PYTHON=${{ matrix.python }}
-          cache-from: type=gha,scope=skymap-ci-${{ matrix.tag }}
-          cache-to: ${{ github.event_name == 'push' && format('type=gha,scope=skymap-ci-{0},mode=max', matrix.tag) || '' }}
 
       - name: Validate OS, interpreter, packages and non-root operation
         run: bash tests/smoke-image.sh skymap-ci-smoke:${{ matrix.tag }} ${{ matrix.ubuntu }} ${{ matrix.python }}
+
+      - name: Validate GitHub runner-owned workspace and unprivileged test execution
+        run: bash tests/smoke-consumer.sh skymap-ci-smoke:${{ matrix.tag }}

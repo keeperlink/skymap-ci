@@ -10,9 +10,12 @@ utilities needed to validate [SKY-MAP host-helper](https://github.com/wikisky-or
 
 The images provide `/usr/bin/python3`, `python3-venv`, `python3-pip`,
 `dpkg-deb`, `visudo`, `cron`, `crontab`, `rsync`, SSH, OpenSSL, Git,
-and standard development utilities. The default user is **non-root**
-(UID/GID 10001). Repository-specific Python dependencies are deliberately
-**not** installed in these images; create a venv instead.
+and standard development utilities. The image starts as **root** so the
+native GitHub Actions container job can check out code and write runner-owned
+file commands. A dedicated **ci account (UID/GID 10001)** is provided for
+unprivileged repository validation. Each consumer explicitly switches to ci
+after preparing a writable checkout. Project Python dependencies remain
+outside the image, installed in a virtual environment.
 
 ## Using the image in GitHub Actions
 
@@ -26,16 +29,26 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
-      - name: Install pinned project dependencies
+      - name: Run pinned offline validation as non-root
         run: |
-          python3 -m venv /tmp/ci-venv
-          /tmp/ci-venv/bin/python -m pip install --only-binary=:all: -r requirements-dev.txt
-      - name: Validate under Ubuntu's own Python
-        run: /tmp/ci-venv/bin/python tests/tools/validate.py --stage offline
+          # Checkout and GitHub file commands use root; validation does not.
+          chown -R ci:ci "$GITHUB_WORKSPACE"
+          runuser -u ci -- bash -c '
+            set -euo pipefail
+            python3 -m venv /tmp/ci-venv
+            /tmp/ci-venv/bin/python -m pip install --only-binary=:all: -r requirements-dev.txt
+            /tmp/ci-venv/bin/python tests/tools/validate.py --stage offline
+          '
 ```
 
-Use **immutable registry digests** when consuming published images. Non-root
-job-container checkout permissions must also pass real consumer CI.
+Use **immutable registry digests** in consumers. Keep checkout, artifact
+upload and GitHub step-summary writing as the root job user, and run only
+repository validation as ci. Do not set container.options --user 10001:
+GitHub Actions manages runner-owned checkout and file-command paths.
+PR CI simulates a runner-owned bind-mounted workspace; verify the actual
+published image in a native GitHub Actions container job before making it a
+required check in skymap-jenkins-host.
+
 
 ## Local build and verification
 
@@ -45,6 +58,7 @@ docker build --pull -f Dockerfile \
   --build-arg EXPECTED_PYTHON=3.14 \
   -t skymap-ci-smoke:ubuntu26.04-py314 .
 bash tests/smoke-image.sh skymap-ci-smoke:ubuntu26.04-py314 26.04 3.14
+bash tests/smoke-consumer.sh skymap-ci-smoke:ubuntu26.04-py314
 ```
 
 For Ubuntu 24.04 use `24.04`, `3.12`, and
@@ -72,9 +86,11 @@ then** logs in and publishes. A dispatch creates four tags:
 - `ubuntu26.04-py314-v<run-number>` (immutable)
 - `ubuntu26.04-py314` (moving alias)
 
-The workflow checks that numbered tags do not already exist and verifies
-each alias has the same OCI digest as its numbered tag. Only `linux/amd64`
-is built. If publication partially fails, reconcile remote tags and digests
-before retrying. Never overwrite numbered tags.
+The workflow checks numbered tags do not already exist, publishes and
+digest-verifies **both immutable tags before moving either alias**, then
+verifies the aliases against the corresponding immutable digests. Only
+linux/amd64 is built. If an alias update fails, the aliases might still be
+temporarily out of sync; reconcile remote tags and digests before retrying.
+Never overwrite numbered tags.
 
 No CI pull request or main-branch push can automatically publish an image.

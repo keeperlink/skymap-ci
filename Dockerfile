@@ -20,7 +20,9 @@ RUN apt-get update \
 LABEL org.opencontainers.image.title="SKY-MAP CI Ubuntu environment" \
       org.opencontainers.image.description="Native Python and Debian package validation tools on Ubuntu"
 
-ENV LANG=C.UTF-8 HOME=/home/ci
-USER 10001:10001
+# GitHub Actions job containers need root for checkout and file commands.
+# Consumers explicitly run project validation under the precreated ci user.
+ENV LANG=C.UTF-8
+USER root
 WORKDIR /home/ci
 CMD ["/bin/bash"]
