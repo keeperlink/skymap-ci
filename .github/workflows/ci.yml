@@ -1,0 +1,59 @@
+name: Validate SKY-MAP CI images
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Ubuntu ${{ matrix.ubuntu }} / Python ${{ matrix.python }}
+    # Public fork PRs must never execute on private SKY-MAP CI runners.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ubuntu: '24.04'
+            python: '3.12'
+            tag: ubuntu24.04-py312
+          - ubuntu: '26.04'
+            python: '3.14'
+            tag: ubuntu26.04-py314
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (Node 24)
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4 (Node 24)
+
+      - name: Build current-security Ubuntu image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7 (Node 24)
+        with:
+          context: .
+          file: Dockerfile
+          pull: true
+          no-cache-filters: runtime-base
+          platforms: linux/amd64
+          load: true
+          tags: skymap-ci-smoke:${{ matrix.tag }}
+          build-args: |
+            UBUNTU_VERSION=${{ matrix.ubuntu }}
+            EXPECTED_PYTHON=${{ matrix.python }}
+
+      - name: Validate OS, interpreter, packages and non-root operation
+        run: bash tests/smoke-image.sh skymap-ci-smoke:${{ matrix.tag }} ${{ matrix.ubuntu }} ${{ matrix.python }}
+
+      - name: Validate GitHub runner-owned workspace and unprivileged test execution
+        run: bash tests/smoke-consumer.sh skymap-ci-smoke:${{ matrix.tag }}
