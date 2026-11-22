@@ -106,6 +106,8 @@ jobs:
               "docker-archive:${RUNNER_TEMP}/skymap-ci-${number}-smoke.tar:skymap-ci-smoke:${tag}"
             docker load --input "${RUNNER_TEMP}/skymap-ci-${number}-smoke.tar"
             bash tests/smoke-image.sh "skymap-ci-smoke:${tag}" "$os" "$py"
+            # Test the same OCI image against runner-owned workspace and summary rules.
+            bash tests/smoke-consumer.sh "skymap-ci-smoke:${tag}"
           done
 
       - name: Require unused immutable version tags on Docker Hub

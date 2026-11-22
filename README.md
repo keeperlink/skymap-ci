@@ -30,25 +30,44 @@ jobs:
         with:
           persist-credentials: false
       - name: Run pinned offline validation as non-root
+        shell: bash
         run: |
-          # Checkout and GitHub file commands use root; validation does not.
+          set -euo pipefail
+          # Preserve the runner's workspace ownership for post-job cleanup.
+          original_owner="$(stat -c '%u:%g' "$GITHUB_WORKSPACE")"
+          ci_summary="$(mktemp /tmp/skymap-ci-summary.XXXXXX)"
+          cleanup() {
+            status=$?
+            # The actual GitHub summary belongs to the runner, not uid 10001.
+            if [[ -s "$ci_summary" && -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+              cat "$ci_summary" >> "$GITHUB_STEP_SUMMARY" || status=1
+            fi
+            chown -R "$original_owner" "$GITHUB_WORKSPACE" || status=1
+            rm -f "$ci_summary" || status=1
+            exit "$status"
+          }
+          trap cleanup EXIT
+          chown ci:ci "$ci_summary"
           chown -R ci:ci "$GITHUB_WORKSPACE"
-          runuser -u ci -- bash -c '
-            set -euo pipefail
-            python3 -m venv /tmp/ci-venv
-            /tmp/ci-venv/bin/python -m pip install --only-binary=:all: -r requirements-dev.txt
-            /tmp/ci-venv/bin/python tests/tools/validate.py --stage offline
-          '
+          runuser -u ci -- env GITHUB_STEP_SUMMARY="$ci_summary" bash -s <<'VALIDATE'
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          python3 -m venv /tmp/ci-venv
+          /tmp/ci-venv/bin/python -m pip install --only-binary=:all: -r requirements-dev.txt
+          /tmp/ci-venv/bin/python tests/tools/validate.py --stage offline
+          VALIDATE
 ```
 
-Use **immutable registry digests** in consumers. Keep checkout, artifact
-upload and GitHub step-summary writing as the root job user, and run only
-repository validation as ci. Do not set container.options --user 10001:
-GitHub Actions manages runner-owned checkout and file-command paths.
-PR CI simulates a runner-owned bind-mounted workspace; verify the actual
-published image in a native GitHub Actions container job before making it a
-required check in skymap-jenkins-host.
-
+Use **immutable registry digests** in consumers. The root job user handles
+checkout and runner-owned file commands. The validation step temporarily
+makes the checkout writable by `ci`, uses a dedicated writable summary file
+for non-root `validate.py`, appends that summary to the GitHub-owned summary
+as root, and **restores the original workspace UID/GID on exit even when
+validation fails**. Do not set container.options --user 10001: GitHub
+Actions manages runner-owned checkout and file-command paths. CI simulates
+the read-only-to-ci summary boundary and workspace cleanup; separately verify
+the published image in a native GitHub Actions container job before making
+it a required check in skymap-jenkins-host.
 
 ## Local build and verification
 
